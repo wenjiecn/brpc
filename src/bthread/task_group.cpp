@@ -49,7 +49,7 @@
 namespace bthread {
 
 static const bthread_attr_t BTHREAD_ATTR_TASKGROUP = {
-    BTHREAD_STACKTYPE_UNKNOWN, 0, NULL, BTHREAD_TAG_INVALID };
+    BTHREAD_STACKTYPE_UNKNOWN, 0, NULL, BTHREAD_TAG_INVALID, {0} };
 
 DEFINE_bool(show_bthread_creation_in_vars, false, "When this flags is on, The time "
             "from bthread creation to first run will be recorded and shown in /vars");
@@ -101,7 +101,8 @@ AtomicInteger128::Value AtomicInteger128::load() const {
 #endif // __x86_64__
     return {value[0], value[1]};
 #else // __x86_64__ || __ARM_NEON
-    BAIDU_SCOPED_LOCK(_mutex);
+    // RISC-V and other architectures use mutex fallback
+    BAIDU_SCOPED_LOCK(const_cast<FastPthreadMutex&>(_mutex));
     return _value;
 #endif // __x86_64__ || __ARM_NEON
 }
@@ -114,7 +115,8 @@ void AtomicInteger128::store(Value value) {
     int64x2_t v = vld1q_s64(reinterpret_cast<int64_t*>(&value));
     vst1q_s64(reinterpret_cast<int64_t*>(&_value), v);
 #else
-    BAIDU_SCOPED_LOCK(_mutex);
+    // RISC-V and other architectures use mutex fallback
+    BAIDU_SCOPED_LOCK(const_cast<FastPthreadMutex&>(_mutex));
     _value = value;
 #endif // __x86_64__ || __ARM_NEON
 }
@@ -1141,6 +1143,7 @@ void print_task(std::ostream& os, bthread_t tid, bool enable_trace,
            << "\nattr={stack_type=" << attr.stack_type
            << " flags=" << attr.flags
            << " specified_tag=" << attr.tag
+           << " name=" << attr.name
            << " keytable_pool=" << attr.keytable_pool
            << "}\nhas_tls=" << has_tls
            << "\nuptime_ns=" << butil::cpuwide_time_ns() - cpuwide_start_ns

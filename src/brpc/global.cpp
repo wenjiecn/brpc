@@ -75,6 +75,7 @@
 #include "brpc/policy/ubrpc2pb_protocol.h"
 #include "brpc/policy/sofa_pbrpc_protocol.h"
 #include "brpc/policy/memcache_binary_protocol.h"
+#include "brpc/policy/couchbase_protocol.h"
 #include "brpc/policy/streaming_rpc_protocol.h"
 #include "brpc/policy/mongo_protocol.h"
 #include "brpc/policy/redis_protocol.h"
@@ -518,6 +519,16 @@ static void GlobalInitializeOrDieImpl() {
         exit(1);
     }
 
+    Protocol couchbase_protocol = { ParseCouchbaseMessage,
+                                    SerializeCouchbaseRequest,
+                                    PackCouchbaseRequest,
+                                    NULL, ProcessCouchbaseResponse,
+                                    NULL, NULL, GetCouchbaseMethodName,
+                                    CONNECTION_TYPE_ALL, "couchbase" };
+    if (RegisterProtocol(PROTOCOL_COUCHBASE, couchbase_protocol) != 0) {
+        exit(1);
+    }
+
     Protocol redis_protocol = { ParseRedisMessage,
                                 SerializeRedisRequest,
                                 PackRedisRequest,
@@ -635,7 +646,9 @@ static void GlobalInitializeOrDieImpl() {
 
     // We never join GlobalUpdate, let it quit with the process.
     bthread_t th;
-    CHECK(bthread_start_background(&th, NULL, GlobalUpdate, NULL) == 0)
+    bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+    bthread_attr_set_name(&attr, "GlobalUpdate");
+    CHECK(bthread_start_background(&th, &attr, GlobalUpdate, NULL) == 0)
         << "Fail to start GlobalUpdate";
 }
 

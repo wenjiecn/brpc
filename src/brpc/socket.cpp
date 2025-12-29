@@ -728,7 +728,7 @@ int Socket::OnCreated(const SocketOptions& options) {
     _keytable_pool = options.keytable_pool;
     _tos = 0;
     _remote_side = options.remote_side;
-    _local_side = butil::EndPoint();
+    _local_side = options.local_side;
     _on_edge_triggered_events = options.on_edge_triggered_events;
     _user = options.user;
     _conn = options.conn;
@@ -895,7 +895,7 @@ void Socket::BeforeRecycled() {
     const SocketId asid = _agent_socket_id.load(butil::memory_order_relaxed);
     if (asid != INVALID_SOCKET_ID) {
         SocketUniquePtr ptr;
-        if (Socket::Address(asid, &ptr) == 0) {
+        if (Address(asid, &ptr) == 0) {
             ptr->ReleaseAdditionalReference();
         }
     }
@@ -1296,7 +1296,17 @@ int Socket::Connect(const timespec* abstime,
     CHECK_EQ(0, butil::make_close_on_exec(sockfd));
     // We need to do async connect (to manage the timeout by ourselves).
     CHECK_EQ(0, butil::make_non_blocking(sockfd));
-    
+    if (local_side().ip != butil::IP_ANY) {
+        struct sockaddr_storage cli_addr;
+        if (butil::endpoint2sockaddr(local_side(), &cli_addr, &addr_size) != 0) {
+            PLOG(ERROR) << "Fail to get client sockaddr";
+            return -1;
+        }
+        if (::bind(sockfd, (struct sockaddr*)&cli_addr, addr_size) != 0) {
+            PLOG(ERROR) << "Fail to bind client socket, errno=" << strerror(errno);
+            return -1;
+        }
+    }
     const int rc = ::connect(
         sockfd, (struct sockaddr*)&serv_addr, addr_size);
     if (rc != 0 && errno != EINPROGRESS) {
@@ -1319,7 +1329,7 @@ int Socket::Connect(const timespec* abstime,
         SocketOptions options;
         options.bthread_tag = _io_event.bthread_tag();
         options.user = req;
-        if (Socket::Create(options, &connect_id) != 0) {
+        if (Create(options, &connect_id) != 0) {
             LOG(FATAL) << "Fail to create Socket";
             delete req;
             return -1;
@@ -1328,7 +1338,7 @@ int Socket::Connect(const timespec* abstime,
         // `connect_id'. We hold an additional reference here to
         // ensure `req' to be valid in this scope
         SocketUniquePtr s;
-        CHECK_EQ(0, Socket::Address(connect_id, &s));
+        CHECK_EQ(0, Address(connect_id, &s));
 
         // Add `sockfd' into epoll so that `HandleEpollOutRequest' will
         // be called with `req' when epoll event reaches
@@ -1425,7 +1435,7 @@ int Socket::ConnectIfNot(const timespec* abstime, WriteRequest* req) {
 
 void Socket::WakeAsEpollOut() {
     _epollout_butex->fetch_add(1, butil::memory_order_release);
-    bthread::butex_wake_except(_epollout_butex, 0);
+    bthread::butex_wake_except(_epollout_butex, INVALID_BTHREAD);
 }
 
 int Socket::OnOutputEvent(void* user_data, uint32_t,
@@ -1436,7 +1446,7 @@ int Socket::OnOutputEvent(void* user_data, uint32_t,
     // added into epoll, these sockets miss the signal inside
     // `SetFailed' and therefore must be signalled here using
     // `AddressFailedAsWell' to prevent waiting forever
-    if (Socket::AddressFailedAsWell(id, &s) < 0) {
+    if (AddressFailedAsWell(id, &s) < 0) {
         // Ignore recycled sockets
         return -1;
     }
@@ -1456,7 +1466,7 @@ int Socket::OnOutputEvent(void* user_data, uint32_t,
 void Socket::HandleEpollOutTimeout(void* arg) {
     SocketId id = (SocketId)arg;
     SocketUniquePtr s;
-    if (Socket::Address(id, &s) != 0) {
+    if (Address(id, &s) != 0) {
         return;
     }
     EpollOutRequest* req = dynamic_cast<EpollOutRequest*>(s->user());
@@ -1491,8 +1501,10 @@ void Socket::AfterAppConnected(int err, void* data) {
         // requests are not setup yet. check the comment on Setup() in Write()
         req->Setup(s);
         bthread_t th;
+        bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+        bthread_attr_set_name(&attr, "KeepWrite");
         if (bthread_start_background(
-                &th, &BTHREAD_ATTR_NORMAL, KeepWrite, req) != 0) {
+                &th, &attr, KeepWrite, req) != 0) {
             PLOG(WARNING) << "Fail to start KeepWrite";
             KeepWrite(req);
         }
@@ -1530,10 +1542,11 @@ int Socket::KeepWriteIfConnected(int fd, int err, void* data) {
         // Run ssl connect in a new bthread to avoid blocking
         // the current bthread (thus blocking the EventDispatcher)
         bthread_t th;
-        std::unique_ptr<google::protobuf::Closure> thrd_func(brpc::NewCallback(
-                Socket::CheckConnectedAndKeepWrite, fd, err, data));
-        if ((err = bthread_start_background(&th, &BTHREAD_ATTR_NORMAL,
-                                            RunClosure, thrd_func.get())) == 0) {
+        std::unique_ptr<google::protobuf::Closure> thrd_func(
+            NewCallback(CheckConnectedAndKeepWrite, fd, err, data));
+        bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+        bthread_attr_set_name(&attr, "CheckConnectedAndKeepWrite");
+        if ((err = bthread_start_background(&th, &attr, RunClosure, thrd_func.get())) == 0) {
             thrd_func.release();
             return 0;
         } else {
@@ -1705,6 +1718,8 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
 
     int saved_errno = 0;
     bthread_t th;
+    bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+    bthread_attr_set_name(&attr, "KeepWrite");
     SocketUniquePtr ptr_for_keep_write;
     ssize_t nw = 0;
     int ret = 0;
@@ -1779,7 +1794,7 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
 KEEPWRITE_IN_BACKGROUND:
     ReAddress(&ptr_for_keep_write);
     req->set_socket(ptr_for_keep_write.release());
-    if (bthread_start_background(&th, &BTHREAD_ATTR_NORMAL,
+    if (bthread_start_background(&th, &attr,
                                  KeepWrite, req) != 0) {
         LOG(FATAL) << "Fail to start KeepWrite";
         KeepWrite(req);
@@ -2266,6 +2281,7 @@ int Socket::OnInputEvent(void* user_data, uint32_t events,
         bthread_attr_t attr = thread_attr;
         attr.keytable_pool = p->_keytable_pool;
         attr.tag = bthread_self_tag();
+        bthread_attr_set_name(&attr, "ProcessEvent");
         if (FLAGS_usercode_in_coroutine) {
             ProcessEvent(p);
 #if BRPC_WITH_RDMA
@@ -2316,7 +2332,7 @@ std::ostream& operator<<(std::ostream& os, const ObjectPtr<T>& obj) {
 
 void Socket::DebugSocket(std::ostream& os, SocketId id) {
     SocketUniquePtr ptr;
-    int ret = Socket::AddressFailedAsWell(id, &ptr);
+    int ret = AddressFailedAsWell(id, &ptr);
     if (ret < 0) {
         os << "SocketId=" << id << " is invalid or recycled";
         return;
@@ -2805,6 +2821,7 @@ int Socket::GetPooledSocket(SocketUniquePtr* pooled_socket) {
     if (socket_pool == NULL) {
         SocketOptions opt;
         opt.remote_side = remote_side();
+        opt.local_side = butil::EndPoint(local_side().ip, 0);
         opt.user = user();
         opt.on_edge_triggered_events = _on_edge_triggered_events;
         opt.initial_ssl_ctx = _ssl_ctx;
@@ -2906,6 +2923,7 @@ int Socket::GetShortSocket(SocketUniquePtr* short_socket) {
     SocketId id;
     SocketOptions opt;
     opt.remote_side = remote_side();
+    opt.local_side = butil::EndPoint(local_side().ip, 0);
     opt.user = user();
     opt.on_edge_triggered_events = _on_edge_triggered_events;
     opt.initial_ssl_ctx = _ssl_ctx;
@@ -2913,7 +2931,7 @@ int Socket::GetShortSocket(SocketUniquePtr* short_socket) {
     opt.app_connect = _app_connect;
     opt.use_rdma =  (_rdma_ep) ? true : false;
     if (get_client_side_messenger()->Create(opt, &id) != 0 ||
-        Socket::Address(id, short_socket) != 0) {
+        Address(id, short_socket) != 0) {
         return -1;
     }
     (*short_socket)->ShareStats(this);
@@ -2924,7 +2942,7 @@ int Socket::GetAgentSocket(SocketUniquePtr* out, bool (*checkfn)(Socket*)) {
     SocketId id = _agent_socket_id.load(butil::memory_order_relaxed);
     SocketUniquePtr tmp_sock;
     do {
-        if (Socket::Address(id, &tmp_sock) == 0) {
+        if (Address(id, &tmp_sock) == 0) {
             if (checkfn == NULL || checkfn(tmp_sock.get())) {
                 out->swap(tmp_sock);
                 return 0;
